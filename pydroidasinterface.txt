@@ -1,0 +1,159 @@
+from usb4a import usb
+from usbserial4a import serial4a
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.widget import Widget
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.clock import Clock
+from kivy.graphics import Color, Line
+import re, math, threading, time
+
+# ===================================================
+# Circular Gauge Widget
+# ===================================================
+class CircularGauge(BoxLayout):
+    def __init__(self, title="Sensor", min_val=0, max_val=1023, **kwargs):
+        super().__init__(orientation='horizontal', spacing=15, padding=10, **kwargs)
+        self.title, self.min_val, self.max_val, self.value = title, min_val, max_val, 0
+
+        self.name_label = Label(text=self.title, font_size='18sp', size_hint=(0.3, 1), halign='left', valign='middle')
+        self.name_label.bind(size=self.name_label.setter('text_size'))
+
+        self.gauge = Widget(size_hint=(0.5, 1))
+        self.gauge.bind(size=self.update_gauge, pos=self.update_gauge)
+
+        self.value_label = Label(text="0", font_size='18sp', size_hint=(0.2, 1), halign='right', valign='middle')
+        self.value_label.bind(size=self.value_label.setter('text_size'))
+
+        self.add_widget(self.name_label)
+        self.add_widget(self.gauge)
+        self.add_widget(self.value_label)
+
+    def set_value(self, val):
+        self.value = max(self.min_val, min(self.max_val, val))
+        self.value_label.text = f"{int(val)}"
+        self.gauge.canvas.clear()
+        self.update_gauge()
+
+    def update_gauge(self, *args):
+        with self.gauge.canvas:
+            Color(1, 1, 1)
+            radius = min(self.gauge.width, self.gauge.height) / 2 - 10
+            cx, cy = self.gauge.center
+            Line(circle=(cx, cy, radius), width=1.2)
+            for i in range(11):
+                tick_angle = 225 - (270 * i / 10)
+                rad = math.radians(tick_angle)
+                x1 = cx + radius * 0.85 * math.cos(rad)
+                y1 = cy + radius * 0.85 * math.sin(rad)
+                x2 = cx + radius * 0.95 * math.cos(rad)
+                y2 = cy + radius * 0.95 * math.sin(rad)
+                Line(points=[x1, y1, x2, y2], width=1)
+            Color(1, 0, 0)
+            angle = 225 - (270 * (self.value - self.min_val) / (self.max_val - self.min_val))
+            rad = math.radians(angle)
+            nx = cx + radius * 0.8 * math.cos(rad)
+            ny = cy + radius * 0.8 * math.sin(rad)
+            Line(points=[cx, cy, nx, ny], width=2)
+
+# ===================================================
+# Dashboard Layout
+# ===================================================
+class Dashboard(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation='vertical', spacing=10, padding=10, **kwargs)
+        self.ser = None
+        self.connect_usb()
+
+        # Gauges
+        self.mag = CircularGauge("Magnetic", 0, 1023)
+        self.flame = CircularGauge("Flame", 0, 1023)
+        self.light = CircularGauge("Light", 0, 1023)
+        self.temp = CircularGauge("Temp (°C)", 0, 60)
+        self.smoke = CircularGauge("Smoke (ppm)", 0, 2000)
+        for g in [self.mag, self.flame, self.light, self.temp, self.smoke]:
+            self.add_widget(g)
+
+        # Buttons
+        btn_row = BoxLayout(size_hint=(1, .15), spacing=10)
+        self.on_btn = Button(text="BUZZER ON", background_color=(0, 0.6, 0, 1), font_size='18sp')
+        self.off_btn = Button(text="BUZZER OFF", background_color=(0.5, 0, 0, 1), font_size='18sp')
+        btn_row.add_widget(self.on_btn)
+        btn_row.add_widget(self.off_btn)
+        self.add_widget(btn_row)
+
+        self.on_btn.bind(on_press=lambda x: self.send_command('1'))
+        self.off_btn.bind(on_press=lambda x: self.send_command('0'))
+
+        threading.Thread(target=self.read_serial, daemon=True).start()
+
+    def connect_usb(self):
+        try:
+            devices = usb.get_usb_device_list()
+            if not devices:
+                print("❌ No USB devices found.")
+                return
+            self.device = devices[0]
+            self.ser = serial4a.get_serial_port(self.device.getDeviceName(), baudrate=9600, timeout=1)
+            print("✅ Connected to Arduino.")
+        except Exception as e:
+            print("USB error:", e)
+
+    def send_command(self, cmd):
+        try:
+            if self.ser:
+                self.ser.write((cmd + '\n').encode())
+                self.ser.flush()
+                print(f"Sent: {cmd}")
+        except Exception as e:
+            print("Send error:", e)
+
+    def read_serial(self):
+        if not self.ser:
+            return
+        while True:
+            try:
+                line = self.ser.readline().decode(errors='ignore').strip()
+                if line:
+                    print("Raw:", line)
+                    self.process_line(line)
+            except Exception as e:
+                print("Read error:", e)
+            time.sleep(0.05)
+
+    def process_line(self, line):
+        line = line.lower()
+        try:
+            if "magnetic" in line:
+                val = int(re.findall(r'\d+', line)[0]); Clock.schedule_once(lambda dt: self.mag.set_value(val))
+            elif "flame level" in line:
+                val = int(re.findall(r'\d+', line)[0]); Clock.schedule_once(lambda dt: self.flame.set_value(val))
+            elif "light level" in line:
+                val = int(re.findall(r'\d+', line)[0]); Clock.schedule_once(lambda dt: self.light.set_value(val))
+            elif "temperature" in line:
+                val = float(re.findall(r'\d+', line)[0]); Clock.schedule_once(lambda dt: self.temp.set_value(val))
+            elif "smoke level" in line:
+                val = int(re.findall(r'\d+', line)[0]); Clock.schedule_once(lambda dt: self.smoke.set_value(val))
+            elif "buzzer" in line:  # feedback from Arduino
+                if "on" in line:
+                    Clock.schedule_once(lambda dt: self.set_buzzer_state(True))
+                elif "off" in line:
+                    Clock.schedule_once(lambda dt: self.set_buzzer_state(False))
+        except:
+            pass
+
+    def set_buzzer_state(self, state):
+        if state:
+            self.on_btn.background_color = (0, 1, 0, 1)
+            self.off_btn.background_color = (0.3, 0, 0, 1)
+        else:
+            self.on_btn.background_color = (0, 0.5, 0, 1)
+            self.off_btn.background_color = (1, 0, 0, 1)
+
+class SensorApp(App):
+    def build(self):
+        return Dashboard()
+
+if __name__ == '__main__':
+    SensorApp().run()
